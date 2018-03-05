@@ -1,144 +1,262 @@
-#include <linux/init.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/init.h>
 
 #include <linux/kernel.h>	/* printk() */
 #include <linux/slab.h>		/* kmalloc() */
+#include <linux/fs.h>		/* everything... */
 #include <linux/errno.h>	/* error codes */
 #include <linux/types.h>	/* size_t */
+#include <linux/proc_fs.h>
+#include <linux/fcntl.h>	/* O_ACCMODE */
+#include <linux/seq_file.h>
+#include <linux/cdev.h>
 
+#include <asm/uaccess.h>	/* copy_*_user */
+
+#include "hello.h"
+
+MODULE_LICENSE("Dual BSD/GPL");
+
+int hello_major =   HELLO_MAJOR;
+int hello_minor =   0;
+int hello_nr_devs = HELLO_NR_DEVS;	/* number of bare hello devices */
 
 
 MODULE_LICENSE("Dual BSD/GPL");
 
+struct hello_dev *hello_devices;	/* allocated in hello_init_module */
 
 /*
- * Empty out the scull device; must be called with the device
- * semaphore held.
+ * Open and close
  */
-int scull_trim(struct scull_dev *dev)
-{
-	struct scull_qset *next, *dptr;
-	int qset = dev->qset;   /* "dev" is not-null */
-	int i;
 
-	for (dptr = dev->data; dptr; dptr = next) { /* all the list items */
-		if (dptr->data) {
-			for (i = 0; i < qset; i++)
-				kfree(dptr->data[i]);
-			kfree(dptr->data);
-			dptr->data = NULL;
-		}
-		next = dptr->next;
-		kfree(dptr);
-	}
-	dev->size = 0;
-	dev->quantum = scull_quantum;
-	dev->qset = scull_qset;
-	dev->data = NULL;
-	return 0;
-}
-#ifdef SCULL_DEBUG /* use proc only if debugging */
-/*
- * The proc filesystem: function to read and entry
- */
- static int scullmem_proc_show(struct seq_file *s, void *v)
+int hello_open(struct inode *inode, struct file *filp)
 {
-	int i, j;
+	struct hello_dev *dev; /* device information */
 
-	for (i = 0; i < scull_nr_devs ; i++) {
-		struct scull_dev *d = &scull_devices[i];
-		struct scull_qset *qs = d->data;
-		if (down_interruptible(&d->sem))
+	dev = container_of(inode->i_cdev, struct hello_dev, cdev);
+	filp->private_data = dev; /* for other methods */
+
+	/* now trim to 0 the length of the device if open was write-only */
+	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY) {
+        /*
+		if (down_interruptible(&dev->sem))
 			return -ERESTARTSYS;
-		seq_printf(s,"\nDevice %i: qset %i, q %i, sz %li\n",
-				i, d->qset, d->quantum, d->size);
-		
-		for (; qs ; qs = qs->next) { /* scan the list */
-			seq_printf(s, "  item at %p, qset at %p\n",
-					qs, qs->data);
-			if (qs->data && !qs->next) /* dump only the last item */
-				for (j = 0; j < d->qset; j++) {
-					if (qs->data[j])
-						seq_printf(s,
-								"    % 4i: %8p\n",
-								j, qs->data[j]);
-				}
-		}
-		up(&scull_devices[i].sem);
+		up(&dev->sem); */
 	}
-
-	return 0;
+	return 0;          /* success */
 }
 
-static int scullmem_proc_open(struct inode *inode, struct file *file)  
+int hello_release(struct inode *inode, struct file *filp)
 {
-	return single_open(file, scullmem_proc_show, NULL); 
-} 
+	return 0;
+}
+/*
+ * Data management: read and write
+ */
+
+ssize_t hello_read(struct file *filp, char __user *buf, size_t count,
+                loff_t *f_pos)
+{
+	struct hello_dev *dev = filp->private_data; 
+	ssize_t retval = 0;
+
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+	if (*f_pos >= HELLO_MAXSIZE)
+		goto out;
+	if (*f_pos + count > HELLO_MAXSIZE)
+		count = HELLO_MAXSIZE - *f_pos;
 
 
-struct scull_dev *scull_devices;	/* allocated in scull_init_module */
+	/* read only up to the end of this quantum */
+	if (copy_to_user(buf,dev->data+*f_pos, count)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	*f_pos += count;
+	retval = count;
 
-static int scull_init_module(void)
+  out:
+	up(&dev->sem);
+	return retval;
+}
+
+ssize_t hello_write(struct file *filp, const char __user *buf, size_t count,
+                loff_t *f_pos)
+{
+	struct hello_dev *dev = filp->private_data;
+	ssize_t retval = -ENOMEM; /* value used in "goto out" statements */
+
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+
+	/* write only up to the end of this quantum */
+	if (count + dev->size > HELLO_MAXSIZE)
+		count = HELLO_MAXSIZE - dev->size;
+
+	if (copy_from_user(dev->data+*f_pos, buf, count)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	*f_pos += count;
+    dev->size += count;
+	retval = count;
+    printk(KERN_NOTICE "[hello] f_pos:%lld, dev->size:%ld", *f_pos, dev->size);
+
+  out:
+	up(&dev->sem);
+	return retval;
+}
+
+/*
+ * The "extended" operations -- only seek
+ */
+
+loff_t hello_llseek(struct file *filp, loff_t off, int whence)
+{
+	struct hello_dev *dev = filp->private_data;
+	loff_t newpos;
+
+	switch(whence) {
+	  case 0: /* SEEK_SET */
+		newpos = off;
+		break;
+
+	  case 1: /* SEEK_CUR */
+		newpos = filp->f_pos + off;
+		break;
+
+	  case 2: /* SEEK_END */
+		newpos = dev->size + off;
+		break;
+
+	  default: /* can't happen */
+		return -EINVAL;
+	}
+	if (newpos < 0) return -EINVAL;
+	filp->f_pos = newpos;
+	return newpos;
+}
+
+
+/*
+ * Create a set of file operations for our proc file.
+ */
+struct file_operations hello_fops = {
+	.owner =    THIS_MODULE,
+	.llseek =   hello_llseek,
+	.read =     hello_read,
+	.write =    hello_write,
+	.open =     hello_open,
+	.release =  hello_release,
+};
+
+
+/*
+ * Actually create (and remove) the /proc file(s).
+ 
+static void hello_create_proc(void)
+{
+	proc_create("hellomem", 0, NULL, &hellomem_proc_fops);
+	proc_create("helloseq", 0, NULL, &hello_proc_ops);
+}
+
+static void hello_remove_proc(void)
+{
+	remove_proc_entry("hellomem", NULL );
+	remove_proc_entry("helloseq", NULL);
+}
+*/
+/*
+ * Set up the char_dev structure for this device.
+ */
+static void hello_setup_cdev(struct hello_dev *dev, int index)
+{
+	int err, devno = MKDEV(hello_major, hello_minor + index);
+    
+	cdev_init(&dev->cdev, &hello_fops);
+	dev->cdev.owner = THIS_MODULE;
+	dev->cdev.ops = &hello_fops;
+	err = cdev_add (&dev->cdev, devno, 1);
+	/* Fail gracefully if need be */
+	if (err)
+		printk(KERN_NOTICE "Error %d adding hello%d", err, index);
+}
+
+void hello_exit(void)
+{
+	int i;
+	dev_t devno = MKDEV(hello_major, hello_minor);
+
+	/* Get rid of our char dev entries */
+	if (hello_devices) {
+		for (i = 0; i < hello_nr_devs; i++) {
+            if(hello_devices[i].data)
+                kfree(hello_devices[i].data);
+			cdev_del(&hello_devices[i].cdev);
+		}
+		kfree(hello_devices);
+	}
+
+	/* cleanup_module is never called if registering failed */
+	unregister_chrdev_region(devno, hello_nr_devs);
+	printk(KERN_ALERT"Goodbye,cruel world\n");
+}
+
+static int hello_init(void)
 {
 	int result, i;
 	dev_t dev = 0;
 
+	printk(KERN_ALERT"Hello world ! \n");
 /*
  * Get a range of minor numbers to work with, asking for a dynamic
  * major unless directed otherwise at load time.
  */
-	if (scull_major) {
-		dev = MKDEV(scull_major, scull_minor);
-		result = register_chrdev_region(dev, scull_nr_devs, "scull");
+	if (hello_major) {
+		dev = MKDEV(hello_major, hello_minor);
+		result = register_chrdev_region(dev, hello_nr_devs, "hello");
 	} else {
-		result = alloc_chrdev_region(&dev, scull_minor, scull_nr_devs,
-				"scull");
-		scull_major = MAJOR(dev);
+		result = alloc_chrdev_region(&dev, hello_minor, hello_nr_devs,
+				"hello");
+		hello_major = MAJOR(dev);
 	}
 	if (result < 0) {
-		printk(KERN_WARNING "scull: can't get major %d\n", scull_major);
+		printk(KERN_WARNING "hello: can't get major %d\n", hello_major);
 		return result;
 	}
 
-        /* 
+    /* 
 	 * allocate the devices -- we can't have them static, as the number
 	 * can be specified at load time
 	 */
-	scull_devices = kmalloc(scull_nr_devs * sizeof(struct scull_dev), GFP_KERNEL);
-	if (!scull_devices) {
+	hello_devices = kmalloc(hello_nr_devs * sizeof(struct hello_dev), GFP_KERNEL);
+	if (!hello_devices) {
 		result = -ENOMEM;
 		goto fail;  /* Make this more graceful */
 	}
-	memset(scull_devices, 0, scull_nr_devs * sizeof(struct scull_dev));
+	memset(hello_devices, 0, hello_nr_devs * sizeof(struct hello_dev));
 
-        /* Initialize each device. */
-	for (i = 0; i < scull_nr_devs; i++) {
-		scull_devices[i].quantum = scull_quantum;
-		scull_devices[i].qset = scull_qset;
-		sema_init(&scull_devices[i].sem, 1);
-		scull_setup_cdev(&scull_devices[i], i);
+    /* Initialize each device. */
+	for (i = 0; i < hello_nr_devs; i++) {
+		hello_devices[i].data = kmalloc(HELLO_MAXSIZE ,GFP_KERNEL);
+		if(!hello_devices[i].data){
+            result = -ENOMEM;
+            goto fail;
+        }
+        memset(hello_devices[i].data,0,sizeof(HELLO_MAXSIZE));
+        hello_devices[i].size = 0;
+		sema_init(&hello_devices[i].sem, 1);
+		hello_setup_cdev(&hello_devices[i], i);
 	}
-
-        /* At this point call the init function for any friend device */
-	dev = MKDEV(scull_major, scull_minor + scull_nr_devs);
-	dev += scull_p_init(dev);
-	dev += scull_access_init(dev);
-
-#ifdef SCULL_DEBUG /* only when debugging */
-	scull_create_proc();
-#endif
 
 	return 0; /* succeed */
 
   fail:
-	scull_cleanup_module();
+	hello_exit();
 	return result;
-}
-
-
-static void hello_exit(void)
-{
-	printk(KERN_ALERT"Goodbye,cruel world\n");
 }
 
 module_init(hello_init);

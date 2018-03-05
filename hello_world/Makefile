@@ -1,4 +1,4 @@
-obj-m := scull.o
+obj-m := hello.o
 
 KERNELDIR := /lib/modules/3.2.79/build
 PWD := $(shell pwd)
